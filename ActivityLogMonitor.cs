@@ -1,9 +1,13 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading.Tasks;
 using Azure.Core;
 using Azure.Identity;
+using Azure.ResourceManager;
+using Azure.ResourceManager.Authorization;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
@@ -73,14 +77,17 @@ namespace IAMDetectionTool
                 _logger.LogInformation("🔑 Obtaining access token...");
                 var token = await credential.GetTokenAsync(tokenRequestContext);
 
-                // Prepare Kusto query
+                // Create ARM client for role assignment enrichment
+                var armClient = new ArmClient(credential);
+
+                // Prepare Kusto query - extended to 30 minutes for better detection
                 string query = @"
                     AzureActivity
                     | where TimeGenerated > ago(30m)
                     | where CategoryValue == 'Administrative'
                     | where OperationNameValue has 'Microsoft.Authorization/roleAssignments'
                     | project 
-                        EventId = _ResourceId,
+                        EventId = CorrelationId,
                         EventTime = TimeGenerated,
                         OperationName = OperationNameValue,
                         Caller,
@@ -133,14 +140,18 @@ namespace IAMDetectionTool
 
                                     if (iamEvent != null)
                                     {
-                                        _logger.LogInformation($"📝 Processing: {iamEvent.OperationName}");
+                                        _logger.LogInformation($"📝 Processing: {iamEvent.OperationName} by {iamEvent.Caller}");
+                                        
+                                        // Enrich with role assignment details
+                                        await EnrichWithRoleDetails(iamEvent, armClient);
+                                        
                                         await ProcessIAMEvent(iamEvent, dbHelper, riskCalculator);
                                         processedCount++;
                                     }
                                 }
                                 catch (Exception ex)
                                 {
-                                    _logger.LogError($"Error processing row: {ex.Message}");
+                                    _logger.LogError($"❌ Error processing row: {ex.Message}");
                                 }
                             }
 
@@ -148,7 +159,7 @@ namespace IAMDetectionTool
                         }
                         else
                         {
-                            _logger.LogInformation("ℹ️ No IAM events found in the last 10 minutes");
+                            _logger.LogInformation("ℹ️ No IAM events found in the last 30 minutes");
                         }
                     }
                     else
@@ -193,19 +204,23 @@ namespace IAMDetectionTool
                     try
                     {
                         var props = JObject.Parse(propertiesJson);
+                        
+                        // Try different paths to get role assignment details
                         var requestBody = props["requestbody"]?["Properties"];
-
                         if (requestBody != null)
                         {
                             iamEvent.PrincipalId = requestBody["PrincipalId"]?.ToString();
                             iamEvent.RoleDefinitionId = requestBody["RoleDefinitionId"]?.ToString();
                         }
 
+                        // Extract status code
+                        iamEvent.StatusCode = props["statusCode"]?.ToString();
+
                         iamEvent.RawEventData = propertiesJson;
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Properties parsing is optional
+                        _logger.LogWarning($"⚠️ Could not parse properties: {ex.Message}");
                     }
                 }
 
@@ -213,8 +228,98 @@ namespace IAMDetectionTool
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Error parsing row: {ex.Message}");
+                _logger.LogError($"❌ Error parsing row: {ex.Message}");
                 return null;
+            }
+        }
+
+        private async Task EnrichWithRoleDetails(IAMEvent iamEvent, ArmClient armClient)
+        {
+            try
+            {
+                // Only enrich for 'write' operations (new assignments)
+                if (string.IsNullOrEmpty(iamEvent.ResourceId) || 
+                    !iamEvent.OperationName?.Contains("write", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    return;
+                }
+
+                _logger.LogInformation($"🔍 Enriching event with role assignment details...");
+
+                // Parse the resource ID to get the role assignment
+                var roleAssignmentId = new Azure.Core.ResourceIdentifier(iamEvent.ResourceId);
+                var roleAssignment = armClient.GetRoleAssignmentResource(roleAssignmentId);
+
+                // Fetch the role assignment details
+                var roleAssignmentData = await roleAssignment.GetAsync();
+
+                // Extract role assignment details
+                iamEvent.PrincipalId = roleAssignmentData.Value.Data.PrincipalId.ToString();
+                iamEvent.PrincipalType = roleAssignmentData.Value.Data.PrincipalType.ToString();
+                iamEvent.RoleDefinitionId = roleAssignmentData.Value.Data.RoleDefinitionId.ToString();
+                iamEvent.Scope = roleAssignmentData.Value.Data.Scope;
+
+                // Get role name from role definition ID
+                var roleName = GetRoleName(roleAssignmentData.Value.Data.RoleDefinitionId.ToString());
+                iamEvent.RoleName = roleName;
+
+                // Extract resource name from scope
+                if (!string.IsNullOrEmpty(iamEvent.Scope))
+                {
+                    var scopeParts = iamEvent.Scope.Split('/');
+                    iamEvent.ResourceName = scopeParts.Length > 0 ? scopeParts[scopeParts.Length - 1] : null;
+                }
+
+                // Set principal name as type + short ID for now
+                if (!string.IsNullOrEmpty(iamEvent.PrincipalId))
+                {
+                    var shortId = iamEvent.PrincipalId.Length > 8 
+                        ? iamEvent.PrincipalId.Substring(0, 8) 
+                        : iamEvent.PrincipalId;
+                    iamEvent.PrincipalName = $"{iamEvent.PrincipalType}: {shortId}...";
+                }
+
+                _logger.LogInformation($"✅ Enriched - Role: {iamEvent.RoleName}, Principal: {iamEvent.PrincipalType}, Scope: {iamEvent.ResourceName}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"⚠️ Could not enrich with role details: {ex.Message}");
+                // Don't fail the entire event processing if enrichment fails
+                // We'll still have basic data from the activity log
+            }
+        }
+
+        private string GetRoleName(string roleDefinitionId)
+        {
+            // Common Azure built-in role IDs to names mapping
+            var knownRoles = new Dictionary<string, string>
+            {
+                { "8e3af657-a8ff-443c-a75c-2fe8c4bcb635", "Owner" },
+                { "b24988ac-6180-42a0-ab88-20f7382dd24c", "Contributor" },
+                { "acdd72a7-3385-48ef-bd42-f606fba81ae7", "Reader" },
+                { "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9", "User Access Administrator" },
+                { "f58310d9-a9f6-439a-9e8d-f62e7b41a168", "Role Based Access Control Administrator" },
+                { "ba92f5b4-2d11-453d-a403-e96b0029c9fe", "Storage Blob Data Contributor" },
+                { "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1", "Storage Blob Data Reader" },
+                { "b7e6dc6d-f1e8-4753-8033-0f276bb0955b", "Storage Blob Data Owner" }
+            };
+
+            try
+            {
+                // Extract just the GUID from the role definition ID
+                var roleGuid = roleDefinitionId.Split('/').Last().ToLower();
+
+                // Check if it's a known role
+                if (knownRoles.TryGetValue(roleGuid, out var roleName))
+                {
+                    return roleName;
+                }
+
+                return $"Custom Role ({roleGuid.Substring(0, 8)}...)";
+            }
+            catch
+            {
+                return "Unknown Role";
             }
         }
 
@@ -249,11 +354,18 @@ namespace IAMDetectionTool
 
                 if (riskAssessment.RiskScore >= 60)
                 {
-                    _logger.LogWarning($"🚨 HIGH RISK DETECTED!");
+                    _logger.LogWarning($"");
+                    _logger.LogWarning($"🚨🚨🚨 HIGH RISK EVENT DETECTED! 🚨🚨🚨");
                     _logger.LogWarning($"   Score: {riskAssessment.RiskScore}");
                     _logger.LogWarning($"   Level: {riskAssessment.RiskLevel}");
                     _logger.LogWarning($"   Caller: {iamEvent.Caller}");
+                    _logger.LogWarning($"   Role: {iamEvent.RoleName ?? "Unknown"}");
+                    _logger.LogWarning($"   Principal: {iamEvent.PrincipalName ?? iamEvent.PrincipalId ?? "Unknown"}");
+                    _logger.LogWarning($"   Operation: {iamEvent.OperationName}");
                     _logger.LogWarning($"   Reason: {riskAssessment.Reason}");
+                    _logger.LogWarning($"   EventId: {iamEvent.EventId}");
+                    _logger.LogWarning($"🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨");
+                    _logger.LogWarning($"");
                 }
                 else
                 {
@@ -263,6 +375,7 @@ namespace IAMDetectionTool
             catch (Exception ex)
             {
                 _logger.LogError($"❌ Error processing event: {ex.Message}");
+                _logger.LogError($"Stack trace: {ex.StackTrace}");
             }
         }
     }
