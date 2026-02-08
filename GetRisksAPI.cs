@@ -62,25 +62,24 @@ namespace IAMDetectionTool
                 await conn.OpenAsync();
 
                 string query = @"
-                    SELECT TOP 100
-                        r.AssessmentId,
-                        r.EventId,
-                        r.RiskScore,
-                        r.RiskLevel,
-                        r.Reason,
-                        r.IsEscalation,
-                        r.IsSuspicious,
-                        r.DetectedDate,
-                        r.Status,
-                        e.EventTime,
-                        e.Caller,
-                        e.PrincipalName,
-                        e.RoleName,
-                        e.ResourceName,
-                        e.OperationName
-                    FROM RiskAssessments r
-                    INNER JOIN IAMEvents e ON r.EventId = e.EventId
-                    ORDER BY r.DetectedDate DESC";
+                    SELECT TOP 100 
+                        AssessmentId,
+                        EventId,
+                        RiskScore,
+                        RiskLevel,
+                        Reason,
+                        IsEscalation,
+                        IsSuspicious,
+                        DetectedDate,
+                        Status,
+                        EventTime,
+                        Caller,
+                        PrincipalName,
+                        RoleName,
+                        ResourceName,
+                        OperationName
+                    FROM vw_RiskAssessments_LocalTime
+                    ORDER BY DetectedDate DESC";
 
                 using (SqlCommand cmd = new SqlCommand(query, conn))
                 {
