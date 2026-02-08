@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AzureFunctionsVersion>v4</AzureFunctionsVersion>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Azure.Identity" Version="1.17.1" />
+    <PackageReference Include="Azure.Messaging.EventGrid" Version="5.0.0" />
+    <PackageReference Include="Azure.Monitor.Query" Version="1.3.0" />
+    <PackageReference Include="Azure.ResourceManager" Version="1.13.2" />
+    <PackageReference Include="Azure.ResourceManager.Authorization" Version="1.1.6" />
+    <PackageReference Include="Azure.ResourceManager.Resources" Version="1.11.2" />
+    <!-- Application Insights isn't enabled by default. See https://aka.ms/AAt8mw4. -->
+    <!-- <PackageReference Include="Microsoft.ApplicationInsights.WorkerService" Version="2.22.0" /> -->
+    <!-- <PackageReference Include="Microsoft.Azure.Functions.Worker.ApplicationInsights" Version="2.0.0" /> -->
+    <PackageReference Include="Microsoft.Azure.Functions.Worker" Version="2.51.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http" Version="3.3.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http.AspNetCore" Version="2.0.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Timer" Version="4.3.1" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.0.7" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="host.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="local.settings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <Using Include="System.Threading.ExecutionContext" Alias="ExecutionContext" />
+  </ItemGroup>
+
+  <!-- Workaround: Worker SDK expects extensions.json at OutputPath/bin/ but Functions SDK may emit it at OutputPath/. Ensure path exists. -->
+  <Target Name="_EnsureExtensionsJsonPath" AfterTargets="_WorkerExtensionsBuild" BeforeTargets="_FunctionsExtensionUpdateMetadata">
+    <PropertyGroup>
+      <_ExtensionsJsonDir>$(_FunctionsExtensionsOutputPath)\bin</_ExtensionsJsonDir>
+      <_ExtensionsJsonFallback>$(_FunctionsExtensionsOutputPath)\$(_FunctionsExtensionsJsonName)</_ExtensionsJsonFallback>
+    </PropertyGroup>
+    <MakeDir Directories="$(_ExtensionsJsonDir)" Condition="!Exists('$(_ExtensionsJsonDir)')" />
+    <Copy SourceFiles="$(_ExtensionsJsonFallback)" DestinationFiles="$(_ExtensionsJsonDir)\$(_FunctionsExtensionsJsonName)" Condition="Exists('$(_ExtensionsJsonFallback)') And !Exists('$(_ExtensionsJsonDir)\$(_FunctionsExtensionsJsonName)')" />
+    <WriteLinesToFile File="$(_ExtensionsJsonDir)\$(_FunctionsExtensionsJsonName)" Lines="{ &quot;extensions&quot;: [] }" Overwrite="false" Condition="!Exists('$(_ExtensionsJsonDir)\$(_FunctionsExtensionsJsonName)')" />
+  </Target>
+</Project>
