@@ -27,7 +27,7 @@ namespace IAMDetectionTool
 
         [Function("ActivityLogMonitor")]
         public async Task Run(
-            [TimerTrigger("0 */5 * * * *")] TimerInfo timer)
+            [TimerTrigger("0 */2 * * * *")] TimerInfo timer)
         {
             _logger.LogInformation($"=== Activity Log Monitor Started at: {DateTime.UtcNow} ===");
 
@@ -69,7 +69,6 @@ namespace IAMDetectionTool
             {
                 _logger.LogInformation($"🔍 Querying Log Analytics Workspace: {workspaceId}");
 
-                // Get access token using Managed Identity
                 var credential = new DefaultAzureCredential();
                 var tokenRequestContext = new TokenRequestContext(
                     new[] { "https://api.loganalytics.io/.default" });
@@ -77,15 +76,14 @@ namespace IAMDetectionTool
                 _logger.LogInformation("🔑 Obtaining access token...");
                 var token = await credential.GetTokenAsync(tokenRequestContext);
 
-                // Create ARM client for role assignment enrichment
                 var armClient = new ArmClient(credential);
 
-                // Prepare Kusto query - extended to 30 minutes for better detection
                 string query = @"
                     AzureActivity
-                    | where TimeGenerated > ago(30m)
+                    | where TimeGenerated > ago(10m)
                     | where CategoryValue == 'Administrative'
                     | where OperationNameValue has 'Microsoft.Authorization/roleAssignments'
+                    | summarize arg_max(TimeGenerated, *) by CorrelationId
                     | project 
                         EventId = CorrelationId,
                         EventTime = TimeGenerated,
@@ -100,7 +98,6 @@ namespace IAMDetectionTool
                     | order by EventTime desc
                 ";
 
-                // Call Log Analytics REST API
                 var url = $"https://api.loganalytics.io/v1/workspaces/{workspaceId}/query";
                 var requestBody = new { query = query };
                 var content = new StringContent(
@@ -127,11 +124,13 @@ namespace IAMDetectionTool
                         var columns = table?["columns"] as JArray;
 
                         int rowCount = rows?.Count ?? 0;
-                        _logger.LogInformation($"✅ Query successful! Found {rowCount} events");
+                        _logger.LogInformation($"✅ Query successful! Found {rowCount} unique events");
 
                         if (rows != null && columns != null && rowCount > 0)
                         {
                             int processedCount = 0;
+                            var processedEventIds = new HashSet<string>();
+
                             foreach (JArray row in rows)
                             {
                                 try
@@ -140,11 +139,17 @@ namespace IAMDetectionTool
 
                                     if (iamEvent != null)
                                     {
+                                        if (processedEventIds.Contains(iamEvent.EventId!))
+                                        {
+                                            _logger.LogInformation($"⏭️ Skipping duplicate event: {iamEvent.EventId}");
+                                            continue;
+                                        }
+
+                                        processedEventIds.Add(iamEvent.EventId!);
+
                                         _logger.LogInformation($"📝 Processing: {iamEvent.OperationName} by {iamEvent.Caller}");
                                         
-                                        // Enrich with role assignment details
                                         await EnrichWithRoleDetails(iamEvent, armClient);
-                                        
                                         await ProcessIAMEvent(iamEvent, dbHelper, riskCalculator);
                                         processedCount++;
                                     }
@@ -155,11 +160,11 @@ namespace IAMDetectionTool
                                 }
                             }
 
-                            _logger.LogInformation($"✅ Successfully processed {processedCount} IAM events");
+                            _logger.LogInformation($"✅ Successfully processed {processedCount} unique IAM events");
                         }
                         else
                         {
-                            _logger.LogInformation("ℹ️ No IAM events found in the last 30 minutes");
+                            _logger.LogInformation("ℹ️ No IAM events found in the last 10 minutes");
                         }
                     }
                     else
@@ -197,7 +202,6 @@ namespace IAMDetectionTool
                     Scope = GetColumnValue(row, columns, "ResourceId")
                 };
 
-                // Try to parse Properties for additional details
                 string? propertiesJson = GetColumnValue(row, columns, "Properties");
                 if (!string.IsNullOrEmpty(propertiesJson))
                 {
@@ -205,7 +209,6 @@ namespace IAMDetectionTool
                     {
                         var props = JObject.Parse(propertiesJson);
                         
-                        // Try different paths to get role assignment details
                         var requestBody = props["requestbody"]?["Properties"];
                         if (requestBody != null)
                         {
@@ -213,9 +216,7 @@ namespace IAMDetectionTool
                             iamEvent.RoleDefinitionId = requestBody["RoleDefinitionId"]?.ToString();
                         }
 
-                        // Extract status code
                         iamEvent.StatusCode = props["statusCode"]?.ToString();
-
                         iamEvent.RawEventData = propertiesJson;
                     }
                     catch (Exception ex)
@@ -237,7 +238,6 @@ namespace IAMDetectionTool
         {
             try
             {
-                // Only enrich for 'write' operations (new assignments)
                 if (string.IsNullOrEmpty(iamEvent.ResourceId) || 
                     !iamEvent.OperationName?.Contains("write", StringComparison.OrdinalIgnoreCase) == true)
                 {
@@ -246,31 +246,22 @@ namespace IAMDetectionTool
 
                 _logger.LogInformation($"🔍 Enriching event with role assignment details...");
 
-                // Parse the resource ID to get the role assignment
                 var roleAssignmentId = new Azure.Core.ResourceIdentifier(iamEvent.ResourceId);
                 var roleAssignment = armClient.GetRoleAssignmentResource(roleAssignmentId);
-
-                // Fetch the role assignment details
                 var roleAssignmentData = await roleAssignment.GetAsync();
 
-                // Extract role assignment details
                 iamEvent.PrincipalId = roleAssignmentData.Value.Data.PrincipalId.ToString();
                 iamEvent.PrincipalType = roleAssignmentData.Value.Data.PrincipalType.ToString();
                 iamEvent.RoleDefinitionId = roleAssignmentData.Value.Data.RoleDefinitionId.ToString();
                 iamEvent.Scope = roleAssignmentData.Value.Data.Scope;
+                iamEvent.RoleName = GetRoleName(roleAssignmentData.Value.Data.RoleDefinitionId.ToString());
 
-                // Get role name from role definition ID
-                var roleName = GetRoleName(roleAssignmentData.Value.Data.RoleDefinitionId.ToString());
-                iamEvent.RoleName = roleName;
-
-                // Extract resource name from scope
                 if (!string.IsNullOrEmpty(iamEvent.Scope))
                 {
                     var scopeParts = iamEvent.Scope.Split('/');
                     iamEvent.ResourceName = scopeParts.Length > 0 ? scopeParts[scopeParts.Length - 1] : null;
                 }
 
-                // Set principal name as type + short ID for now
                 if (!string.IsNullOrEmpty(iamEvent.PrincipalId))
                 {
                     var shortId = iamEvent.PrincipalId.Length > 8 
@@ -284,14 +275,11 @@ namespace IAMDetectionTool
             catch (Exception ex)
             {
                 _logger.LogWarning($"⚠️ Could not enrich with role details: {ex.Message}");
-                // Don't fail the entire event processing if enrichment fails
-                // We'll still have basic data from the activity log
             }
         }
 
         private string GetRoleName(string roleDefinitionId)
         {
-            // Common Azure built-in role IDs to names mapping
             var knownRoles = new Dictionary<string, string>
             {
                 { "8e3af657-a8ff-443c-a75c-2fe8c4bcb635", "Owner" },
@@ -306,15 +294,11 @@ namespace IAMDetectionTool
 
             try
             {
-                // Extract just the GUID from the role definition ID
                 var roleGuid = roleDefinitionId.Split('/').Last().ToLower();
-
-                // Check if it's a known role
                 if (knownRoles.TryGetValue(roleGuid, out var roleName))
                 {
                     return roleName;
                 }
-
                 return $"Custom Role ({roleGuid.Substring(0, 8)}...)";
             }
             catch
